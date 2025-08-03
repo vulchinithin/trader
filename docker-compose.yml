@@ -23,3 +23,18 @@ services:
       KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"  # Ensure only once
     depends_on:
       - zookeeper
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: "password"
+      POSTGRES_DB: "marketdb"
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+
+volumes:
+  timescale-data:
