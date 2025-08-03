@@ -31,11 +31,10 @@ STREAMS = cfg["binance"]["streams"]
 MAX_ATTEMPTS = cfg["binance"]["reconnect"]["max_attempts"]
 BASE = cfg["binance"]["reconnect"]["backoff_base"]
 FACTOR = cfg["binance"]["reconnect"]["backoff_factor"]
-PING_INTERVAL = cfg["binance"]["ping_interval"]  # e.g., 180 for 3 minutes
+PING_INTERVAL = cfg["binance"]["ping_interval"]
 
 KAFKA_BOOTSTRAP = "localhost:9092"
 
-# Singleton producer
 _producer = None
 _producer_lock = asyncio.Lock()
 
@@ -56,15 +55,16 @@ async def produce_to_kafka(topic, message):
     except Exception as e:
         logger.error(f"Failed to publish: {e}")
 
-async def send_ping(ws):
+async def send_heartbeat(ws):
     while True:
-        await asyncio.sleep(PING_INTERVAL)
         try:
-            await ws.ping()
-            logger.debug("Sent ping to keep connection alive")
-        except Exception as e:
-            logger.warning(f"Ping failed: {e}")
-            break
+            pong = await asyncio.wait_for(ws.ping(), timeout=10)
+            await pong
+            logger.debug("Heartbeat ping successful")
+        except asyncio.TimeoutError:
+            logger.warning("Ping timeout - forcing reconnection")
+            raise Exception("Ping timeout - reconnecting")
+        await asyncio.sleep(PING_INTERVAL)
 
 async def connect_and_stream(symbol, interval):
     stream_names = [s.format(symbol=symbol, interval=interval) for s in STREAMS]
@@ -72,23 +72,29 @@ async def connect_and_stream(symbol, interval):
     attempt = 0
     while attempt < MAX_ATTEMPTS:
         try:
-            async with websockets.connect(url, ping_interval=PING_INTERVAL) as ws:
-                logger.info(f"Connected to {url}")
-                ping_task = asyncio.create_task(send_ping(ws))  # Start ping task
-                async for raw in ws:
+            ws = await websockets.connect(url, ping_interval=PING_INTERVAL, ping_timeout=20)
+            logger.info(f"Connected to {url}")
+            heartbeat_task = asyncio.create_task(send_heartbeat(ws))
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30)  # Detect silence
                     data = json.loads(raw)
                     topic = f"market-data-{symbol}"
                     asyncio.create_task(produce_to_kafka(topic, data))
-                ping_task.cancel()  # Clean up ping task
+                except asyncio.TimeoutError:
+                    logger.warning("Recv timeout detected for {symbol} - forcing reconnection")
+                    raise Exception("Recv timeout - reconnecting")
+            heartbeat_task.cancel()
         except Exception as e:
+            if 'heartbeat_task' in locals():
+                heartbeat_task.cancel()
             wait = BASE * (FACTOR ** attempt) + random.random()
-            logger.warning(f"Connection lost ({e}), retrying in {wait:.1f}s")
+            logger.warning(f"Connection lost for {symbol} ({e}), retrying in {wait:.1f}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
             await asyncio.sleep(wait)
             attempt += 1
-            await asyncio.sleep(1)  # Extra delay to avoid rate limits
-    # REST fallback after max attempts
+            await asyncio.sleep(1)  # Avoid rate limits
     logger.error(f"Max attempts reached for {symbol}. Falling back to REST.")
-    historical = rest_fetch(symbol, interval, limit=500)  # Fetch last 500 klines
+    historical = rest_fetch(symbol, interval, limit=500)
     for item in historical:
         asyncio.create_task(produce_to_kafka(f"market-data-{symbol}", item))
 
