@@ -1,0 +1,19 @@
+# config/websocket_config.yaml
+binance:
+  base_url: "wss://stream.binance.com:9443/ws"
+  streams:
+    - "{symbol}@trade"
+    - "{symbol}@kline_{interval}"
+    - "{symbol}@bookTicker"
+  reconnect:
+    max_attempts: 10
+    backoff_base: 1  # seconds
+    backoff_factor: 2
+  ping_interval: 20  # seconds
+assets:
+  symbols:
+    - "btcusdt"
+    - "ethusdt"
+  intervals:
+    - "1m"
+    - "5m"

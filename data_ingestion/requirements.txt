@@ -1,0 +1,5 @@
+websockets>=10.4
+PyYAML>=6.0
+aiokafka==0.11.0
+python-binance>=1.0.17
+kafka-python>=2.0.2
