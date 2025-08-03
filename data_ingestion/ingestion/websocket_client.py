@@ -102,12 +102,14 @@ def ensure_topics(symbols):
     try:
         admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP)
         existing_topics = admin_client.list_topics()
+        num_partitions = cfg.get("kafka", {}).get("num_partitions", 4)  # Default 4 partitions[9][15]
+        replication_factor = cfg.get("kafka", {}).get("replication_factor", 1)  # Default 1 for local[10]
         for symbol in symbols:
             topic = f"market-data-{symbol}"
             if topic not in existing_topics:
-                new_topic = NewTopic(name=topic, num_partitions=1, replication_factor=1)
+                new_topic = NewTopic(name=topic, num_partitions=num_partitions, replication_factor=replication_factor)
                 admin_client.create_topics([new_topic])
-                logger.info(f"Created topic: {topic}")
+                logger.info(f"Created topic: {topic} with {num_partitions} partitions and replication {replication_factor}")
         admin_client.close()
     except Exception as e:
         logger.error(f"Failed to ensure topics: {e}")

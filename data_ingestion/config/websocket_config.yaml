@@ -17,3 +17,6 @@ assets:
   intervals:
     - "1m"
     - "5m"
+kafka:
+  num_partitions: 4
+  replication_factor: 1
