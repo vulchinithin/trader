@@ -7,3 +7,5 @@ polars
 # For hyperparameter tuning
 ray[tune]
 hyperopt
+# For experiment tracking and model registry
+mlflow

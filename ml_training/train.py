@@ -10,6 +10,11 @@ import argparse
 import joblib
 from ray import tune
 from ray.tune.search.hyperopt import HyperOptSearch
+from ray.air.config import RunConfig
+from ray.air.integrations.mlflow import MLflowLoggerCallback
+import mlflow
+import mlflow.xgboost
+import mlflow.sklearn
 
 # --- Path Setup ---
 if __package__ is None or __package__ == '':
@@ -25,11 +30,9 @@ logger = logging.getLogger("trainer")
 
 # --- Ray Tune Search Space ---
 XGBOOST_SEARCH_SPACE = {
-    "n_estimators": tune.randint(100, 1000),
-    "learning_rate": tune.loguniform(1e-4, 1e-1),
-    "max_depth": tune.randint(3, 10),
-    "subsample": tune.uniform(0.5, 1.0),
-    "colsample_bytree": tune.uniform(0.5, 1.0),
+    "n_estimators": tune.randint(100, 500),
+    "learning_rate": tune.loguniform(1e-3, 1e-1),
+    "max_depth": tune.randint(3, 7),
 }
 
 # --- Data Preparation ---
@@ -47,13 +50,37 @@ def tune_xgboost_trainable(config, data):
     tune.report(mse=mse)
 
 # --- Model Training Functions ---
+def train_xgboost_regressor(symbol: str, data: pl.DataFrame):
+    logger.info("--- Starting XGBoost Regressor Single Run ---")
+    with mlflow.start_run(run_name=f"xgboost_single_run_{symbol}"):
+        mlflow.set_tag("model_type", "xgboost_regressor")
+        mlflow.set_tag("symbol", symbol)
+
+        prepared_df = prepare_regression_data(data, target_col="close", horizon=5)
+        if prepared_df.is_empty(): return
+
+        feature_cols = [c for c in prepared_df.columns if c not in ["ts", "target", "close", "volume"]]
+        X = prepared_df[feature_cols].to_pandas()
+        y = prepared_df["target"].to_pandas()
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+        params = {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 3, "random_state": 42}
+        mlflow.log_params(params)
+
+        model = xgb.XGBRegressor(objective='reg:squarederror', **params)
+        model.fit(X_train, y_train)
+
+        predictions = model.predict(X_test)
+        mse = mean_squared_error(y_test, predictions)
+        mlflow.log_metric("mse", mse)
+        logger.info(f"Test MSE: {mse:.6f}")
+
+        mlflow.xgboost.log_model(model, artifact_path="model", registered_model_name=f"{symbol}_xgboost_regressor")
+
 def tune_xgboost_model(symbol: str, data: pl.DataFrame):
-    """Orchestrates a Ray Tune hyperparameter sweep for XGBoost."""
-    logger.info("--- Starting XGBoost Hyperparameter Tuning ---")
+    logger.info("--- Starting XGBoost Hyperparameter Tuning with MLflow ---")
     prepared_df = prepare_regression_data(data, target_col="close", horizon=5)
-    if prepared_df.is_empty():
-        logger.error("Not enough data for tuning.")
-        return
+    if prepared_df.is_empty(): return
 
     feature_cols = [c for c in prepared_df.columns if c not in ["ts", "target", "close", "volume"]]
     X = prepared_df[feature_cols].to_pandas()
@@ -62,53 +89,56 @@ def tune_xgboost_model(symbol: str, data: pl.DataFrame):
 
     data_payload = {"X_train": X_train, "y_train": y_train, "X_test": X_test, "y_test": y_test}
 
-    tuner = tune.Tuner(
-        tune.with_parameters(tune_xgboost_trainable, data=data_payload),
-        param_space=XGBOOST_SEARCH_SPACE,
-        tune_config=tune.TuneConfig(
-            metric="mse",
-            mode="min",
-            search_alg=HyperOptSearch(),
-            num_samples=50, # Number of different hyperparameter combinations to try
-        ),
-    )
-    results = tuner.fit()
-    best_result = results.get_best_result(metric="mse", mode="min")
-    logger.info(f"Tuning complete. Best trial MSE: {best_result.metrics['mse']:.6f}")
-    logger.info(f"Best hyperparameters: {best_result.config}")
-    # Here you would typically retrain the model on the full dataset with the best params and save it.
+    mlflow_callback = MLflowLoggerCallback(experiment_name="asset_training_pipeline", save_artifact=True)
+
+    with mlflow.start_run(run_name=f"xgboost_tuning_run_{symbol}"):
+        tuner = tune.Tuner(
+            tune.with_parameters(tune_xgboost_trainable, data=data_payload),
+            param_space=XGBOOST_SEARCH_SPACE,
+            tune_config=tune.TuneConfig(metric="mse", mode="min", search_alg=HyperOptSearch(), num_samples=10),
+            run_config=RunConfig(name=f"tune_xgboost_{symbol}", callbacks=[mlflow_callback])
+        )
+        results = tuner.fit()
+        best_result = results.get_best_result(metric="mse", mode="min")
+
+        logger.info(f"Tuning complete. Best trial MSE: {best_result.metrics['mse']:.6f}")
+        logger.info(f"Best hyperparameters: {best_result.config}")
+
+        # Log best params and metric to the parent tuning run
+        mlflow.log_params(best_result.config)
+        mlflow.log_metric("best_mse", best_result.metrics['mse'])
 
 def train_anomaly_detector(symbol: str, data: pl.DataFrame):
     logger.info("--- Starting Isolation Forest Anomaly Detector Training ---")
-    feature_cols = [col for col in data.columns if col not in ["ts", "close", "volume"]]
-    data = data.drop_nulls(subset=feature_cols)
-    if data.is_empty(): return
-    X = data[feature_cols].to_pandas()
-    model = IsolationForest(n_estimators=100, contamination='auto', random_state=42)
-    model.fit(X)
-    num_anomalies = (model.predict(X) == -1).sum()
-    logger.info(f"Found {num_anomalies} anomalies.")
-    joblib.dump(model, f"{symbol}_isolation_forest.joblib")
-    logger.info(f"Model saved to {symbol}_isolation_forest.joblib")
+    with mlflow.start_run(run_name=f"iso_forest_single_run_{symbol}"):
+        mlflow.set_tag("model_type", "isolation_forest")
+        mlflow.set_tag("symbol", symbol)
+        feature_cols = [col for col in data.columns if col not in ["ts", "close", "volume"]]
+        data = data.drop_nulls(subset=feature_cols)
+        if data.is_empty(): return
+        X = data[feature_cols].to_pandas()
+        params = {"n_estimators": 100, "contamination": 'auto', "random_state": 42}
+        mlflow.log_params(params)
+        model = IsolationForest(**params)
+        model.fit(X)
+        num_anomalies = (model.predict(X) == -1).sum()
+        mlflow.log_metric("num_anomalies", num_anomalies)
+        logger.info(f"Found {num_anomalies} anomalies.")
+        mlflow.sklearn.log_model(model, artifact_path="model", registered_model_name=f"{symbol}_isolation_forest")
 
-# --- Main Training Orchestrator ---
+# --- Main Orchestrator ---
 def main(args):
     logger.info(f"Starting training pipeline for {args.symbol}...")
+    mlflow.set_experiment("asset_training_pipeline")
     config = load_config()
     training_df = load_training_data(config, args.symbol, args.start_date, args.end_date)
-    if training_df.is_empty():
-        logger.error("No data loaded. Aborting.")
-        return
+    if training_df.is_empty(): return
 
-    if args.tune:
-        if args.model_type != 'xgboost_regressor':
-            logger.error("Tuning is only implemented for 'xgboost_regressor'.")
-            return
-        tune_xgboost_model(args.symbol, training_df)
-    elif args.model_type == 'xgboost_regressor':
-        # For a single run, we can just call the trainable with default params
-        # This part could be refactored to be cleaner, but for now it works.
-        logger.warning("Single run training for XGBoost not implemented in this refactor. Use --tune.")
+    if args.model_type == 'xgboost_regressor':
+        if args.tune:
+            tune_xgboost_model(args.symbol, training_df)
+        else:
+            train_xgboost_regressor(args.symbol, training_df)
     elif args.model_type == 'anomaly_detector':
         train_anomaly_detector(args.symbol, training_df)
     else:
@@ -122,6 +152,5 @@ if __name__ == '__main__':
     parser.add_argument("--model-type", type=str, default="xgboost_regressor",
                         choices=['xgboost_regressor', 'anomaly_detector'])
     parser.add_argument("--tune", action="store_true", help="Flag to run hyperparameter tuning.")
-
     args = parser.parse_args()
     main(args)
