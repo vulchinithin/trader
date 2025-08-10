@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+aiokafka
 # For testing the API
 httpx
 pytest
