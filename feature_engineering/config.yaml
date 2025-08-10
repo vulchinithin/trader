@@ -1,0 +1,7 @@
+feature_generator:
+  rolling_window_size: 2000
+  # Parameters for TA indicators
+  rsi_length: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
