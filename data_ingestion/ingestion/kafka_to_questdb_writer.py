@@ -14,8 +14,10 @@ if __package__ is None or __package__ == '':
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
     from data_ingestion.config.config_loader import load_config
+    from data_ingestion.ingestion.redis_client import get_redis_client
 else:
     from ..config.config_loader import load_config
+    from .redis_client import get_redis_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("questdb_writer")
@@ -25,6 +27,7 @@ cfg = load_config()
 KAFKA_SERVERS = cfg.get("kafka", {}).get("bootstrap_servers", "localhost:9092")
 QUESTDB_HOST = cfg.get("questdb", {}).get("host", "localhost")
 QUESTDB_ILP_PORT = cfg.get("questdb", {}).get("ilp_port", 9009)
+REDIS_CACHE_SIZE = cfg.get("redis", {}).get("price_cache_size", 1000)
 BATCH_SIZE = 1000
 BATCH_TIMEOUT = 1.0  # seconds
 
@@ -41,15 +44,34 @@ def send_to_questdb(lines):
     except Exception as e:
         logger.error(f"An unexpected error occurred when sending to QuestDB: {e}")
 
+# --- Redis Caching ---
+def cache_price_to_redis(redis_client, symbol, price, cache_size):
+    """Caches the latest price to a capped list in Redis."""
+    if not redis_client:
+        return
+    try:
+        key = f"prices:{symbol}"
+        pipe = redis_client.pipeline()
+        pipe.lpush(key, price)
+        pipe.ltrim(key, 0, cache_size - 1)
+        pipe.execute()
+        logger.debug(f"Cached price for {symbol} to Redis.")
+    except Exception as e:
+        logger.error(f"Failed to cache price for {symbol} in Redis: {e}")
+
 # --- Main Consumer Loop ---
 async def consume_and_write():
-    """Consumes messages from Kafka and writes them to QuestDB."""
+    """Consumes messages from Kafka and writes them to QuestDB and Redis."""
     consumer = AIOKafkaConsumer(
         "market-data-.*",
         bootstrap_servers=KAFKA_SERVERS,
         group_id="questdb-writer-group",
         auto_offset_reset="earliest",
     )
+
+    redis_client = get_redis_client(cfg)
+    if not redis_client:
+        logger.warning("Could not connect to Redis. Price caching will be disabled.")
 
     await consumer.start()
     logger.info("Kafka consumer started for QuestDB writer.")
@@ -60,20 +82,22 @@ async def consume_and_write():
     try:
         async for msg in consumer:
             try:
-                data = json.loads(msg.value)
+                data = json.loads(msg.value.decode('utf-8')) # Decode bytes to string
 
-                # Determine the table and timestamp from the message type
-                # This assumes kline data format for now
                 if 'k' in data: # Kline data
                     kline = data['k']
+                    symbol = data['s']
+                    price = kline['c']
+
+                    cache_price_to_redis(redis_client, symbol, price, REDIS_CACHE_SIZE)
+
                     table = 'market_data'
-                    ts = int(kline['t']) * 1_000_000 # Convert ms to ns
-                    tags = f"symbol={data['s']},instrument_type={data.get('instrument_type', 'spot')}"
-                    fields = f"price={kline['c']},volume={kline['v']}"
+                    ts = int(kline['t']) * 1_000_000
+                    tags = f"symbol={symbol},instrument_type={data.get('instrument_type', 'spot')}"
+                    fields = f"price={price},volume={kline['v']}"
                     line = f"{table},{tags} {fields} {ts}\n"
                     batch.append(line)
 
-                # Check if batch is ready to be sent
                 current_time = time.time()
                 if len(batch) >= BATCH_SIZE or (current_time - last_send_time) >= BATCH_TIMEOUT:
                     if batch:
@@ -87,12 +111,13 @@ async def consume_and_write():
                 logger.warning(f"Message from {msg.topic} is missing expected key: {e}. Message: {data}")
 
     finally:
-        # Send any remaining messages in the batch before shutting down
         if batch:
             send_to_questdb("".join(batch))
 
         logger.info("Stopping consumer...")
         await consumer.stop()
+        if redis_client:
+            redis_client.close()
 
 if __name__ == "__main__":
     try:
