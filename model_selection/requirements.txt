@@ -1,0 +1,7 @@
+mlflow
+pandas
+# We will also need to connect to the backtester
+# I will handle this via sys.path
+polars
+psycopg2-binary
+vectorbt

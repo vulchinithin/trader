@@ -10,9 +10,8 @@ if __package__ is None or __package__ == '':
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
-    from data_ingestion.config.config_loader import load_config
-else:
-    from ..data_ingestion.config.config_loader import load_config
+
+from data_ingestion.config.config_loader import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,6 @@ def load_historical_data(config, symbol: str, start_date: str, end_date: str) ->
         if conn:
             try:
                 df = pl.read_database(query, conn)
-                # vectorbt works well with a datetime column, let's ensure it's sorted.
                 df = df.sort("ts")
                 logger.info(f"Loaded {len(df)} rows of historical data for {symbol}.")
                 return df
