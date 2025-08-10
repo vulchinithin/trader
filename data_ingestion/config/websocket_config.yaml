@@ -1,22 +1,23 @@
 # config/websocket_config.yaml
 binance:
-  base_url: "wss://stream.binance.com:9443/ws"
+  # Base URLs for different instrument types
+  instrument_urls:
+    spot: "wss://stream.binance.com:9443/ws"
+    futures_usdm: "wss://fstream.binance.com/ws"
+    futures_coinm: "wss://dstream.binance.com/ws"
+
+  # Stream definitions that can be applied to any instrument type
   streams:
     - "{symbol}@trade"
     - "{symbol}@kline_{interval}"
     - "{symbol}@bookTicker"
+
   reconnect:
     max_attempts: 10
-    backoff_base: 1  # seconds
+    backoff_base: 1      # seconds
     backoff_factor: 2
-  ping_interval: 20  # seconds
-assets:
-  symbols:
-    - "btcusdt"
-    - "ethusdt"
-  intervals:
-    - "1m"
-    - "5m"
-kafka:
-  num_partitions: 4
-  replication_factor: 1
+
+  ping_interval: 20    # seconds
+
+# Note: The specific assets to subscribe to (symbols, intervals, instruments)
+# are now managed in 'selection_config.yaml' to centralize selection logic.
