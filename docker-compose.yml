@@ -44,6 +44,16 @@ services:
     volumes:
       - redis-data:/data
 
+  api_backend:
+    build:
+      context: ./api_backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - questdb
+      - redis
+      - kafka
+
 volumes:
   questdb-data:
   redis-data:

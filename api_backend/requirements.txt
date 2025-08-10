@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+# For testing the API
+httpx
+pytest
