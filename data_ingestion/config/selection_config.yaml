@@ -19,6 +19,7 @@ autonomous:
     window_size: 30  # periods for volatility calculation
     exploration_rate: 0.1  # epsilon for bandit algorithm
     volatility_threshold: 0.05  # min volatility for selection
+    max_selected_symbols: 5 # max number of symbols to select
 redis:
   host: localhost
   port: 6379

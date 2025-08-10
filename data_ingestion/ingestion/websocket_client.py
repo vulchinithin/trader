@@ -17,10 +17,12 @@ if __package__ is None or __package__ == '':
     from data_ingestion.config.config_loader import load_config
     from data_ingestion.ingestion.rest_fallback import fetch_historical as rest_fetch
     from data_ingestion.ingestion.redis_client import get_redis_client, publish_to_redis_stream
+    from data_ingestion.selection.asset_selector import AssetSelector
 else:
     from ..config.config_loader import load_config
     from .rest_fallback import fetch_historical as rest_fetch
     from .redis_client import get_redis_client, publish_to_redis_stream
+    from ..selection.asset_selector import AssetSelector
 
 
 logging.basicConfig(level=logging.INFO)
@@ -41,18 +43,16 @@ MESSAGING_BROKER = cfg.get("messaging", {}).get("broker", "kafka")
 
 async def publish_message(kafka_producer, redis_client, topic, message):
     """Publishes a message to the configured message broker(s)."""
-    if MESSAGING_BROKER in ["kafka", "both"]:
+    if MESSAGING_BROKER in ["kafka", "both"] and kafka_producer:
         await produce_to_kafka(kafka_producer, topic, message)
-    if MESSAGING_BROKER in ["redis", "both"]:
-        # Redis stream name can be the same as the Kafka topic name
+    if MESSAGING_BROKER in ["redis", "both"] and redis_client:
         await asyncio.to_thread(publish_to_redis_stream, redis_client, topic, message)
 
 async def produce_to_kafka(producer, topic, message):
     """Sends a message to a Kafka topic."""
     try:
-        if producer:
-            await producer.send_and_wait(topic, json.dumps(message).encode())
-            logger.info(f"Published to Kafka topic {topic}")
+        await producer.send_and_wait(topic, json.dumps(message).encode())
+        logger.info(f"Published to Kafka topic {topic}")
     except Exception as e:
         logger.error(f"Failed to publish to Kafka topic {topic}: {e}")
 
@@ -126,7 +126,6 @@ def ensure_topics(instruments, symbols):
         return
     try:
         admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
-        # ... (rest of the function is the same)
         existing_topics = admin_client.list_topics()
         num_partitions = cfg.get("kafka", {}).get("num_partitions", 4)
         replication_factor = cfg.get("kafka", {}).get("replication_factor", 1)
@@ -142,49 +141,54 @@ def ensure_topics(instruments, symbols):
             admin_client.create_topics(topics_to_create)
             for t in topics_to_create:
                 logger.info(f"Created topic: {t.name}")
-
         admin_client.close()
     except Exception as e:
         logger.error(f"Failed to ensure Kafka topics: {e}")
 
 async def main():
     """Main function to set up and run the WebSocket client."""
-    selection_cfg = cfg.get("selection", {})
-    instruments = selection_cfg.get("instruments", [])
-    symbols = selection_cfg.get("symbols", [])
-    frequencies = selection_cfg.get("frequencies", ["1m"])
-
-    if not all([instruments, symbols]):
-        logger.error("No instruments or symbols configured. Check selection_config.yaml")
-        return
-
-    # Initialize clients based on config
     kafka_producer = None
-    if MESSAGING_BROKER in ["kafka", "both"]:
-        ensure_topics(instruments, symbols)
-        kafka_producer = AIOKafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            compression_type="zstd"
-        )
-        await kafka_producer.start()
-
     redis_client = None
-    if MESSAGING_BROKER in ["redis", "both"]:
-        redis_client = get_redis_client(cfg)
-        if not redis_client:
-            logger.error("Could not establish Redis connection. Aborting.")
-            if kafka_producer:
-                await kafka_producer.stop()
+
+    try:
+        # Initialize clients based on config
+        if MESSAGING_BROKER in ["kafka", "both"]:
+            kafka_producer = AIOKafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                compression_type="zstd"
+            )
+            await kafka_producer.start()
+
+        if MESSAGING_BROKER in ["redis", "both"] or cfg.get("selection", {}).get("mode") == "autonomous":
+            redis_client = get_redis_client(cfg)
+            if not redis_client:
+                logger.error("Could not establish Redis connection. Aborting.")
+                if kafka_producer: await kafka_producer.stop()
+                return
+
+        # Select assets
+        asset_selector = AssetSelector(cfg, redis_client)
+        symbols, frequencies, instruments = asset_selector.get_selected_assets()
+
+        if not all([instruments, symbols, frequencies]):
+            logger.error("No assets selected to subscribe. Check your configuration and data.")
             return
 
-    tasks = []
-    try:
-        for instrument in instruments:
-            for symbol in symbols:
-                for interval in frequencies:
-                    tasks.append(connect_and_stream(kafka_producer, redis_client, instrument, symbol, interval))
+        if MESSAGING_BROKER in ["kafka", "both"]:
+            ensure_topics(instruments, symbols)
 
-        await asyncio.gather(*tasks)
+        tasks = []
+        # The new selector returns a list of symbols and a parallel list of frequencies
+        for instrument in instruments:
+            for i, symbol in enumerate(symbols):
+                interval = frequencies[i] if i < len(frequencies) else "1m"
+                tasks.append(connect_and_stream(kafka_producer, redis_client, instrument, symbol, interval))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+        else:
+            logger.info("No tasks to run.")
+
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
