@@ -1,0 +1,6 @@
+scikit-learn
+xgboost
+# We will also need a database connector to get data from QuestDB
+psycopg2-binary
+# And polars for data manipulation
+polars
