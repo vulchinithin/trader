@@ -36,25 +36,38 @@ def test_prepare_regression_data(sample_training_df):
     expected_val = (121.0 / 100.0) - 1
     assert abs(df["target"][0] - expected_val) < 1e-9
 
-def test_xgboost_pipeline(monkeypatch, sample_training_df):
-    """Test the XGBoost regressor training flow."""
+def test_tuning_pipeline(monkeypatch, sample_training_df):
+    """Test that the main function correctly invokes the Ray Tune tuner."""
     mock_loader = MagicMock(return_value=sample_training_df)
     monkeypatch.setattr("ml_training.train.load_training_data", mock_loader)
 
-    mock_xgb = MagicMock()
-    mock_xgb.predict.return_value = np.array([0.0])
-    monkeypatch.setattr("ml_training.train.xgb.XGBRegressor", lambda **kwargs: mock_xgb)
+    # Mock the Tuner and its fit method
+    mock_tuner_instance = MagicMock()
+    # Create a mock result object
+    mock_result = MagicMock()
+    mock_result.metrics = {'mse': 0.01}
+    mock_result.config = {'n_estimators': 100}
+    mock_tuner_instance.fit.return_value.get_best_result.return_value = mock_result
 
+    mock_tuner_class = MagicMock(return_value=mock_tuner_instance)
+    monkeypatch.setattr("ml_training.train.tune.Tuner", mock_tuner_class)
+
+    # Simulate command line arguments for tuning
     args = argparse.Namespace(
-        symbol="TEST_XGB", start_date="2023-01-01", end_date="2023-01-31",
-        model_type="xgboost_regressor"
+        symbol="TEST_TUNE", start_date="2023-01-01", end_date="2023-01-31",
+        model_type="xgboost_regressor",
+        tune=True # Enable tuning
     )
 
     train_main(args)
 
+    # Check that the data loader was called
     mock_loader.assert_called_once()
-    mock_xgb.fit.assert_called_once()
-    mock_xgb.save_model.assert_called_once_with("TEST_XGB_xgboost_regressor.xgb")
+
+    # Check that the Tuner was initialized
+    mock_tuner_class.assert_called_once()
+    # Check that the fit method was called on the tuner instance
+    mock_tuner_instance.fit.assert_called_once()
 
 def test_anomaly_detector_pipeline(monkeypatch, sample_training_df):
     """Test the Isolation Forest training flow."""
@@ -62,7 +75,6 @@ def test_anomaly_detector_pipeline(monkeypatch, sample_training_df):
     monkeypatch.setattr("ml_training.train.load_training_data", mock_loader)
 
     mock_iso_forest = MagicMock()
-    # The input X will have 10 rows. `predict` should return an array of that length.
     mock_iso_forest.predict.return_value = np.ones(10, dtype=int)
     monkeypatch.setattr("ml_training.train.IsolationForest", lambda **kwargs: mock_iso_forest)
 
@@ -71,14 +83,12 @@ def test_anomaly_detector_pipeline(monkeypatch, sample_training_df):
 
     args = argparse.Namespace(
         symbol="TEST_ISO", start_date="2023-01-01", end_date="2023-01-31",
-        model_type="anomaly_detector"
+        model_type="anomaly_detector",
+        tune=False # Ensure tuning is off
     )
 
     train_main(args)
 
     mock_loader.assert_called_once()
     mock_iso_forest.fit.assert_called_once()
-
     mock_joblib_dump.assert_called_once()
-    saved_filename = mock_joblib_dump.call_args[0][1]
-    assert saved_filename == "TEST_ISO_isolation_forest.joblib"

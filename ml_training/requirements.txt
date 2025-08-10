@@ -4,3 +4,6 @@ xgboost
 psycopg2-binary
 # And polars for data manipulation
 polars
+# For hyperparameter tuning
+ray[tune]
+hyperopt
