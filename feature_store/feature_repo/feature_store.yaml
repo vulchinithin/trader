@@ -1,0 +1,18 @@
+project: feature_repo
+registry: data/registry.db
+provider: local
+online_store:
+    type: redis
+    # Connection details for the Redis instance defined in the main docker-compose.yml
+    connection_string: "localhost:6379,db=0"
+offline_store:
+    type: postgres
+    # Connection details for the QuestDB instance defined in the main docker-compose.yml
+    host: "localhost"
+    port: 8812
+    database: "qdb"
+    user: "admin"
+    password: "quest"
+entity_key_serialization_version: 3
+auth:
+    type: no_auth

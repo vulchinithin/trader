@@ -1,0 +1,5 @@
+feast[redis]
+feast[questdb]
+# We need psycopg2 to connect to QuestDB's postgres interface.
+# This is often installed as part of the feast provider, but we'll be explicit.
+psycopg2-binary
