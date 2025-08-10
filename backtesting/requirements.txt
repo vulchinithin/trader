@@ -1,0 +1,6 @@
+vectorbt
+psycopg2-binary
+# vectorbt uses numpy and pandas, which will be installed as dependencies.
+# We also need a way to load our main config
+# I will handle this via sys.path for now.
+polars # For data manipulation

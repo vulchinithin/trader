@@ -94,7 +94,13 @@ async def consume_and_write():
                     table = 'market_data'
                     ts = int(kline['t']) * 1_000_000
                     tags = f"symbol={symbol},instrument_type={data.get('instrument_type', 'spot')}"
-                    fields = f"price={price},volume={kline['v']}"
+                    fields = (
+                        f"open={kline['o']},"
+                        f"high={kline['h']},"
+                        f"low={kline['l']},"
+                        f"close={price},"
+                        f"volume={kline['v']}"
+                    )
                     line = f"{table},{tags} {fields} {ts}\n"
                     batch.append(line)
 

@@ -3,7 +3,10 @@
 CREATE TABLE IF NOT EXISTS market_data (
     ts TIMESTAMP,
     symbol SYMBOL,
-    price DOUBLE,
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
     volume DOUBLE,
     instrument_type SYMBOL
 ) timestamp(ts) PARTITION BY DAY;
