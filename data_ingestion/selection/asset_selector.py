@@ -1,7 +1,10 @@
 import logging
 import numpy as np
 import random
-import redis # Import redis at the top level
+import redis
+
+# It's better to run from the project root so that imports work.
+from data_ingestion.ingestion.redis_client import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +16,9 @@ class AssetSelector:
         self.frequencies = config['selection']['frequencies']
         self.instruments = config['selection']['instruments']
 
+        # Use the centralized get_redis_client function
         if redis_client is None:
-            self.redis = redis.Redis(
-                host=config['redis']['host'],
-                port=config['redis']['port'],
-                db=config['redis']['db']
-            )
+            self.redis = get_redis_client(config)
         else:
             self.redis = redis_client
 
@@ -41,6 +41,11 @@ class AssetSelector:
                 raise ValueError(f"Invalid config for autonomous mode: {e}")
 
     def get_selected_assets(self):
+        if self.redis is None and self.mode == 'autonomous':
+            logger.error("Autonomous mode requires a Redis connection, but it's not available.")
+            logger.warning("Falling back to manual selection mode.")
+            self.mode = 'manual'
+
         if self.mode == 'manual':
             logger.info("Using manual selection mode")
             return self.symbols, self.frequencies, self.instruments
@@ -83,6 +88,9 @@ class AssetSelector:
             raise ValueError(f"Unknown mode: {self.mode}")
 
     def calculate_volatility(self, symbol):
+        if self.redis is None:
+            return 0.0
+
         key = f"prices:{symbol}"
         try:
             prices_bytes = self.redis.lrange(key.encode(), -self.window_size, -1)

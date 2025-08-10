@@ -86,3 +86,21 @@ def test_no_volatility_data_fallback(selector, mock_redis):
     symbols, _, _ = selector.get_selected_assets()
     assert len(symbols) == 1
     assert symbols[0] in MOCK_CONFIG['selection']['symbols']
+
+def test_autonomous_mode_with_no_redis(monkeypatch, caplog):
+    """Test that autonomous mode falls back to manual if Redis is unavailable."""
+    # Mock get_redis_client to return None
+    monkeypatch.setattr(
+        "data_ingestion.selection.asset_selector.get_redis_client",
+        lambda config: None
+    )
+
+    config = copy.deepcopy(MOCK_CONFIG)
+    selector = AssetSelector(config) # Don't inject a redis client
+
+    symbols, frequencies, instruments = selector.get_selected_assets()
+
+    # Should fall back to manual mode
+    assert "Falling back to manual selection mode" in caplog.text
+    assert symbols == MOCK_CONFIG['selection']['symbols']
+    assert frequencies == MOCK_CONFIG['selection']['frequencies']
