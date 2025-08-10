@@ -6,6 +6,7 @@ import os
 from unittest.mock import patch, MagicMock
 from datetime import datetime
 import numpy as np
+import argparse
 
 # --- Path Setup ---
 if __package__ is None or __package__ == '':
@@ -13,7 +14,7 @@ if __package__ is None or __package__ == '':
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from ml_training.train import prepare_data, train_model
+from ml_training.train import prepare_regression_data, main as train_main
 
 @pytest.fixture
 def sample_training_df():
@@ -27,45 +28,57 @@ def sample_training_df():
         "macd_signal": [0.4, 0.5, 0.6, 0.5, 0.52, 0.51, 0.50, 0.53, 0.55, 0.58]
     })
 
-def test_prepare_data(sample_training_df):
-    """Test the prepare_data function for creating the target variable."""
+def test_prepare_regression_data(sample_training_df):
+    """Test the data preparation for regression."""
     horizon = 2
-    df = prepare_data(sample_training_df, target_col="close", horizon=horizon)
-
+    df = prepare_regression_data(sample_training_df, target_col="close", horizon=horizon)
     assert len(df) == len(sample_training_df) - horizon
     expected_val = (121.0 / 100.0) - 1
     assert abs(df["target"][0] - expected_val) < 1e-9
 
-def test_train_model_pipeline(monkeypatch, sample_training_df):
-    """
-    Test the main train_model function by mocking the data loader and XGBoost model.
-    """
+def test_xgboost_pipeline(monkeypatch, sample_training_df):
+    """Test the XGBoost regressor training flow."""
     mock_loader = MagicMock(return_value=sample_training_df)
     monkeypatch.setattr("ml_training.train.load_training_data", mock_loader)
 
     mock_xgb = MagicMock()
-    # The test set size will be 1 (20% of 5 rows from prepare_data), so predict should return 1 value.
-    # Let's make it more robust by getting the length of the test set.
-    # prepare_data drops 5 rows, leaving 5. test_size=0.2 -> test set is 1 row.
-    # So predict should return an array of length 1.
-    # Ah, the split is 80/20. 20% of 8 is 1.6, which rounds to 2. Let's recheck the split logic.
-    # `train_test_split` on 5 rows with test_size=0.2 results in 4 train, 1 test.
-    # Let's adjust the sample data to be cleaner. 10 rows -> 5 after prepare -> 4 train, 1 test.
-    # OK, the previous error was `[1, 2]`. This means y_test was 1, predictions was 2.
-    # My hardcoded `np.array([0.0, 0.0])` was the problem.
-    # The split of 8 rows is 6 train, 2 test. So y_test is length 2.
-    # My mock should have been correct. What did I miss?
-
-    # Ah, `prepare_data` on 10 rows with horizon 5 leaves 5 rows.
-    # `train_test_split` on 5 rows with test_size=0.2 gives 4 train and 1 test.
-    # So `y_test` has length 1. My mock should return an array of length 1.
     mock_xgb.predict.return_value = np.array([0.0])
-    monkeypatch.setattr("xgboost.XGBRegressor", lambda **kwargs: mock_xgb)
+    monkeypatch.setattr("ml_training.train.xgb.XGBRegressor", lambda **kwargs: mock_xgb)
 
-    train_model("TEST_SYMBOL", "2023-01-01", "2023-01-31")
+    args = argparse.Namespace(
+        symbol="TEST_XGB", start_date="2023-01-01", end_date="2023-01-31",
+        model_type="xgboost_regressor"
+    )
+
+    train_main(args)
 
     mock_loader.assert_called_once()
     mock_xgb.fit.assert_called_once()
+    mock_xgb.save_model.assert_called_once_with("TEST_XGB_xgboost_regressor.xgb")
 
-    # Check that the model was saved
-    mock_xgb.save_model.assert_called_once_with("TEST_SYMBOL_model.xgb")
+def test_anomaly_detector_pipeline(monkeypatch, sample_training_df):
+    """Test the Isolation Forest training flow."""
+    mock_loader = MagicMock(return_value=sample_training_df)
+    monkeypatch.setattr("ml_training.train.load_training_data", mock_loader)
+
+    mock_iso_forest = MagicMock()
+    # The input X will have 10 rows. `predict` should return an array of that length.
+    mock_iso_forest.predict.return_value = np.ones(10, dtype=int)
+    monkeypatch.setattr("ml_training.train.IsolationForest", lambda **kwargs: mock_iso_forest)
+
+    mock_joblib_dump = MagicMock()
+    monkeypatch.setattr("ml_training.train.joblib.dump", mock_joblib_dump)
+
+    args = argparse.Namespace(
+        symbol="TEST_ISO", start_date="2023-01-01", end_date="2023-01-31",
+        model_type="anomaly_detector"
+    )
+
+    train_main(args)
+
+    mock_loader.assert_called_once()
+    mock_iso_forest.fit.assert_called_once()
+
+    mock_joblib_dump.assert_called_once()
+    saved_filename = mock_joblib_dump.call_args[0][1]
+    assert saved_filename == "TEST_ISO_isolation_forest.joblib"
