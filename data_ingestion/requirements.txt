@@ -5,3 +5,4 @@ python-binance>=1.0.17
 kafka-python>=2.0.2
 redis
 numpy
+zstandard

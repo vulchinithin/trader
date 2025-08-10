@@ -16,9 +16,12 @@ if __package__ is None or __package__ == '':
         sys.path.insert(0, project_root)
     from data_ingestion.config.config_loader import load_config
     from data_ingestion.ingestion.rest_fallback import fetch_historical as rest_fetch
+    from data_ingestion.ingestion.redis_client import get_redis_client, publish_to_redis_stream
 else:
     from ..config.config_loader import load_config
     from .rest_fallback import fetch_historical as rest_fetch
+    from .redis_client import get_redis_client, publish_to_redis_stream
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ws_client")
@@ -32,15 +35,26 @@ BASE = cfg["binance"]["reconnect"]["backoff_base"]
 FACTOR = cfg["binance"]["reconnect"]["backoff_factor"]
 PING_INTERVAL = cfg["binance"]["ping_interval"]
 KAFKA_BOOTSTRAP_SERVERS = cfg['kafka']['bootstrap_servers']
-RATE_LIMIT_BACKOFF = cfg.get("binance", {}).get("rate_limit_backoff", 60) # 60s default backoff
+RATE_LIMIT_BACKOFF = cfg.get("binance", {}).get("rate_limit_backoff", 60)
+MESSAGING_BROKER = cfg.get("messaging", {}).get("broker", "kafka")
+
+
+async def publish_message(kafka_producer, redis_client, topic, message):
+    """Publishes a message to the configured message broker(s)."""
+    if MESSAGING_BROKER in ["kafka", "both"]:
+        await produce_to_kafka(kafka_producer, topic, message)
+    if MESSAGING_BROKER in ["redis", "both"]:
+        # Redis stream name can be the same as the Kafka topic name
+        await asyncio.to_thread(publish_to_redis_stream, redis_client, topic, message)
 
 async def produce_to_kafka(producer, topic, message):
     """Sends a message to a Kafka topic."""
     try:
-        await producer.send_and_wait(topic, json.dumps(message).encode())
-        logger.info(f"Published to {topic}")
+        if producer:
+            await producer.send_and_wait(topic, json.dumps(message).encode())
+            logger.info(f"Published to Kafka topic {topic}")
     except Exception as e:
-        logger.error(f"Failed to publish to {topic}: {e}")
+        logger.error(f"Failed to publish to Kafka topic {topic}: {e}")
 
 async def send_heartbeat(ws):
     """Sends a periodic heartbeat to the WebSocket connection."""
@@ -55,7 +69,7 @@ async def send_heartbeat(ws):
             logger.warning(f"Heartbeat failed: {e}. Forcing reconnection.")
             raise
 
-async def connect_and_stream(producer, instrument_type, symbol, interval):
+async def connect_and_stream(kafka_producer, redis_client, instrument_type, symbol, interval):
     """Connects to a WebSocket stream, handles data, and manages reconnection."""
     base_url = cfg['binance']['instrument_urls'].get(instrument_type)
     if not base_url:
@@ -77,29 +91,26 @@ async def connect_and_stream(producer, instrument_type, symbol, interval):
                         raw = await asyncio.wait_for(ws.recv(), timeout=PING_INTERVAL * 2)
                         data = json.loads(raw)
                         data['instrument_type'] = instrument_type
-                        asyncio.create_task(produce_to_kafka(producer, topic, data))
+                        asyncio.create_task(publish_message(kafka_producer, redis_client, topic, data))
                     except asyncio.TimeoutError:
                         logger.warning(f"No message from {symbol} for {PING_INTERVAL * 2}s. Reconnecting.")
                         raise
         except websockets.exceptions.ConnectionClosed as e:
             if 'heartbeat_task' in locals() and not heartbeat_task.done():
                 heartbeat_task.cancel()
-
-            # Check for signs of rate limiting
             if e.code == 1013 or "rate limit" in str(e.reason).lower() or "429" in str(e.reason):
-                logger.error(f"Rate limit suspected for {symbol} ({instrument_type}). Backing off for {RATE_LIMIT_BACKOFF}s. Reason: {e.reason}")
+                logger.error(f"Rate limit for {symbol} ({instrument_type}). Backing off for {RATE_LIMIT_BACKOFF}s. Reason: {e.reason}")
                 await asyncio.sleep(RATE_LIMIT_BACKOFF)
             else:
                 wait = BASE * (FACTOR ** attempt) + random.uniform(0, 1)
-                logger.warning(f"Conn closed for {symbol} ({instrument_type}): {e}. Retrying in {wait:.1f}s ({attempt+1}/{MAX_ATTEMPTS})")
+                logger.warning(f"Conn closed for {symbol} ({instrument_type}): {e}. Retrying in {wait:.1f}s")
                 await asyncio.sleep(wait)
                 attempt += 1
         except Exception as e:
             if 'heartbeat_task' in locals() and not heartbeat_task.done():
                 heartbeat_task.cancel()
-
             wait = BASE * (FACTOR ** attempt) + random.uniform(0, 1)
-            logger.warning(f"Unhandled exception for {symbol} ({instrument_type}): {e}. Retrying in {wait:.1f}s ({attempt+1}/{MAX_ATTEMPTS})")
+            logger.warning(f"Unhandled exception for {symbol} ({instrument_type}): {e}. Retrying in {wait:.1f}s")
             await asyncio.sleep(wait)
             attempt += 1
 
@@ -107,12 +118,15 @@ async def connect_and_stream(producer, instrument_type, symbol, interval):
     historical = await asyncio.to_thread(rest_fetch, cfg, instrument_type, symbol, interval, limit=500)
     for item in historical:
         item['instrument_type'] = instrument_type
-        asyncio.create_task(produce_to_kafka(producer, topic, item))
+        asyncio.create_task(publish_message(kafka_producer, redis_client, topic, item))
 
 def ensure_topics(instruments, symbols):
-    """Ensures that the necessary Kafka topics exist."""
+    """Ensures that the necessary Kafka topics exist if Kafka is the broker."""
+    if MESSAGING_BROKER not in ["kafka", "both"]:
+        return
     try:
         admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+        # ... (rest of the function is the same)
         existing_topics = admin_client.list_topics()
         num_partitions = cfg.get("kafka", {}).get("num_partitions", 4)
         replication_factor = cfg.get("kafka", {}).get("replication_factor", 1)
@@ -131,7 +145,7 @@ def ensure_topics(instruments, symbols):
 
         admin_client.close()
     except Exception as e:
-        logger.error(f"Failed to ensure topics: {e}")
+        logger.error(f"Failed to ensure Kafka topics: {e}")
 
 async def main():
     """Main function to set up and run the WebSocket client."""
@@ -144,25 +158,42 @@ async def main():
         logger.error("No instruments or symbols configured. Check selection_config.yaml")
         return
 
-    ensure_topics(instruments, symbols)
+    # Initialize clients based on config
+    kafka_producer = None
+    if MESSAGING_BROKER in ["kafka", "both"]:
+        ensure_topics(instruments, symbols)
+        kafka_producer = AIOKafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            compression_type="zstd"
+        )
+        await kafka_producer.start()
 
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
-    await producer.start()
+    redis_client = None
+    if MESSAGING_BROKER in ["redis", "both"]:
+        redis_client = get_redis_client(cfg)
+        if not redis_client:
+            logger.error("Could not establish Redis connection. Aborting.")
+            if kafka_producer:
+                await kafka_producer.stop()
+            return
 
     tasks = []
     try:
         for instrument in instruments:
             for symbol in symbols:
                 for interval in frequencies:
-                    tasks.append(connect_and_stream(producer, instrument, symbol, interval))
+                    tasks.append(connect_and_stream(kafka_producer, redis_client, instrument, symbol, interval))
 
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        if producer is not None:
-            await producer.stop()
+        if kafka_producer:
+            await kafka_producer.stop()
             logger.info("Kafka producer stopped.")
+        if redis_client:
+            redis_client.close()
+            logger.info("Redis client closed.")
 
 if __name__ == "__main__":
     asyncio.run(main())

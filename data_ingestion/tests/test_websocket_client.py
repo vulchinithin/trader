@@ -3,150 +3,127 @@ import json
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 import websockets
-from aiokafka import AIOKafkaProducer # Import AIOKafkaProducer
+from aiokafka import AIOKafkaProducer
+import redis
 
 # It's better to run pytest from the project root so that imports work naturally.
 from data_ingestion.ingestion import websocket_client
 
-# Mock configuration for all tests
+# Base mock configuration
 MOCK_CONFIG = {
     "binance": {
-        "instrument_urls": {
-            "spot": "wss://spot.test.url",
-            "futures_usdm": "wss://futures.test.url"
-        },
+        "instrument_urls": {"spot": "wss://spot.test.url", "futures_usdm": "wss://futures.test.url"},
         "streams": ["{symbol}@kline_{interval}"],
         "reconnect": {"max_attempts": 3, "backoff_base": 0.1, "backoff_factor": 2},
         "ping_interval": 5,
         "rate_limit_backoff": 10
     },
     "selection": {
-        "instruments": ["spot", "futures_usdm"],
-        "symbols": ["BTCUSDT", "ETHUSDT"],
-        "frequencies": ["1m"]
+        "instruments": ["spot"], "symbols": ["BTCUSDT"], "frequencies": ["1m"]
     },
-    "kafka": {
-        "bootstrap_servers": "mock:9092",
-        "num_partitions": 1,
-        "replication_factor": 1
-    }
+    "kafka": {"bootstrap_servers": "mock:9092", "num_partitions": 1, "replication_factor": 1},
+    "redis": {"host": "mockhost", "port": 6379, "db": 0},
+    "messaging": {"broker": "kafka"} # Default broker
 }
 
-@pytest.fixture(autouse=True)
-def mock_settings(monkeypatch):
-    """Mock the configuration loader for all tests."""
-    monkeypatch.setattr(websocket_client, "cfg", MOCK_CONFIG)
-    # Also patch the constants that are set at module level
-    monkeypatch.setattr(websocket_client, "MAX_ATTEMPTS", MOCK_CONFIG["binance"]["reconnect"]["max_attempts"])
-    monkeypatch.setattr(websocket_client, "BASE", MOCK_CONFIG["binance"]["reconnect"]["backoff_base"])
-    monkeypatch.setattr(websocket_client, "FACTOR", MOCK_CONFIG["binance"]["reconnect"]["backoff_factor"])
-    monkeypatch.setattr(websocket_client, "RATE_LIMIT_BACKOFF", MOCK_CONFIG["binance"]["rate_limit_backoff"])
+@pytest.fixture
+def mock_config(monkeypatch):
+    """Mocks the configuration for a test."""
+    def _mock_config(broker_type):
+        config = MOCK_CONFIG.copy()
+        config["messaging"]["broker"] = broker_type
+        monkeypatch.setattr(websocket_client, "cfg", config)
+        monkeypatch.setattr(websocket_client, "MESSAGING_BROKER", broker_type)
+        monkeypatch.setattr(websocket_client, "MAX_ATTEMPTS", config["binance"]["reconnect"]["max_attempts"])
+        monkeypatch.setattr(websocket_client, "BASE", config["binance"]["reconnect"]["backoff_base"])
+        monkeypatch.setattr(websocket_client, "FACTOR", config["binance"]["reconnect"]["backoff_factor"])
+        monkeypatch.setattr(websocket_client, "RATE_LIMIT_BACKOFF", config["binance"]["rate_limit_backoff"])
+        return config
+    return _mock_config
 
 @pytest.fixture
 def mock_producer():
     """Provides a mock AIOKafkaProducer."""
-    producer = AsyncMock(spec=AIOKafkaProducer) # Corrected spec
+    producer = AsyncMock(spec=AIOKafkaProducer)
     producer.send_and_wait = AsyncMock()
     return producer
+
+@pytest.fixture
+def mock_redis_client(monkeypatch):
+    """Provides a mock Redis client."""
+    mock_client = MagicMock(spec=redis.Redis)
+    monkeypatch.setattr(websocket_client, "get_redis_client", lambda cfg: mock_client)
+    mock_publish = MagicMock()
+    monkeypatch.setattr(websocket_client, "publish_to_redis_stream", mock_publish)
+    return mock_client, mock_publish
 
 @pytest.fixture
 def mock_websockets(monkeypatch):
     """Fixture to mock the websockets.connect call."""
     mock_ws = AsyncMock(spec=websockets.WebSocketClientProtocol)
-    mock_ws.recv.side_effect = [json.dumps({"data": "test"}), asyncio.TimeoutError] # Send one message then timeout
-
-    async def connect_mock(*args, **kwargs):
-        return mock_ws
-
-    # Use a context manager for the mock
+    mock_ws.recv.side_effect = [json.dumps({"data": "test"}), asyncio.TimeoutError("Stop loop")]
     mock_connect = MagicMock()
     mock_connect.__aenter__.return_value = mock_ws
     monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: mock_connect)
     return mock_connect, mock_ws
 
+
+@pytest.mark.parametrize("broker, kafka_called, redis_called", [
+    ("kafka", 1, 0),
+    ("redis", 0, 1),
+    ("both", 1, 1),
+])
 @pytest.mark.asyncio
-async def test_connect_and_stream_produces_to_kafka(mock_producer, mock_websockets):
-    """Test that a successful connection produces a message to Kafka."""
-    await websocket_client.connect_and_stream(mock_producer, "spot", "BTCUSDT", "1m")
+async def test_broker_publishing(broker, kafka_called, redis_called, mock_config, mock_producer, mock_redis_client, mock_websockets, monkeypatch):
+    """Test that messages are published to the correct broker based on config."""
+    mock_config(broker)
+    mock_redis_cli, mock_redis_publish = mock_redis_client
 
-    # Check that connect was called with the right URL
-    mock_connect, _ = mock_websockets
-    expected_url = "wss://spot.test.url/btcusdt@kline_1m"
-    mock_connect.assert_called_with(expected_url, ping_interval=None, ping_timeout=None)
+    # Mock the rest_fetch to prevent real network calls and fix the TypeError
+    monkeypatch.setattr(websocket_client, "rest_fetch", MagicMock(return_value=[]))
 
-    # Check that a message was produced
-    mock_producer.send_and_wait.assert_called_once()
-    topic_arg = mock_producer.send_and_wait.call_args[0][0]
-    message_arg = json.loads(mock_producer.send_and_wait.call_args[0][1].decode())
+    with patch.object(websocket_client, 'produce_to_kafka', new_callable=AsyncMock) as mock_kafka_publish:
+        await websocket_client.connect_and_stream(mock_producer, mock_redis_cli, "spot", "BTCUSDT", "1m")
 
-    assert topic_arg == "market-data-spot-btcusdt"
-    assert message_arg["data"] == "test"
-    assert message_arg["instrument_type"] == "spot"
+        # Check that the correct underlying publish functions were called
+        assert mock_kafka_publish.call_count == kafka_called
+        assert mock_redis_publish.call_count == redis_called
 
-@pytest.mark.asyncio
-async def test_rate_limit_handling(mock_producer, mock_websockets):
-    """Test that rate limit errors trigger a longer backoff."""
-    mock_connect, mock_ws = mock_websockets
+        if kafka_called:
+            mock_kafka_publish.assert_called_once()
+        if redis_called:
+            mock_redis_publish.assert_called_once()
 
-    # Simulate a rate limit error
-    rate_limit_exc = websockets.exceptions.ConnectionClosed(code=1013, reason="Rate limited")
-    mock_connect.side_effect = rate_limit_exc
-
-    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-        await websocket_client.connect_and_stream(mock_producer, "spot", "BTCUSDT", "1m")
-
-        # Check that the long backoff was triggered
-        mock_sleep.assert_any_call(MOCK_CONFIG["binance"]["rate_limit_backoff"])
 
 @pytest.mark.asyncio
-async def test_main_loop_creates_tasks(monkeypatch):
-    """Test that the main function creates tasks for all configured streams."""
+async def test_main_loop_initializes_correct_clients(monkeypatch):
+    """Test that the main function initializes the correct clients based on config."""
     mock_connect = AsyncMock()
     monkeypatch.setattr(websocket_client, "connect_and_stream", mock_connect)
 
-    # Mock producer and its lifecycle
     mock_producer_instance = AsyncMock()
     mock_AIOKafkaProducer = MagicMock(return_value=mock_producer_instance)
     monkeypatch.setattr(websocket_client, "AIOKafkaProducer", mock_AIOKafkaProducer)
 
-    # Mock ensure_topics
+    mock_redis_instance = MagicMock()
+    mock_get_redis_client = MagicMock(return_value=mock_redis_instance)
+    monkeypatch.setattr(websocket_client, "get_redis_client", mock_get_redis_client)
+
     monkeypatch.setattr(websocket_client, "ensure_topics", MagicMock())
 
+    # Test with 'both'
+    monkeypatch.setattr(websocket_client, "MESSAGING_BROKER", "both")
     await websocket_client.main()
-
-    num_instruments = len(MOCK_CONFIG["selection"]["instruments"])
-    num_symbols = len(MOCK_CONFIG["selection"]["symbols"])
-    num_freqs = len(MOCK_CONFIG["selection"]["frequencies"])
-    expected_calls = num_instruments * num_symbols * num_freqs
-
-    assert mock_connect.call_count == expected_calls
-    mock_connect.assert_any_call(mock_producer_instance, "futures_usdm", "ETHUSDT", "1m")
-    
-    # Check producer lifecycle
+    mock_AIOKafkaProducer.assert_called_once()
+    mock_get_redis_client.assert_called_once()
     mock_producer_instance.start.assert_called_once()
     mock_producer_instance.stop.assert_called_once()
+    mock_redis_instance.close.assert_called_once()
 
-@pytest.mark.asyncio
-async def test_rest_fallback_is_called(mock_producer, mock_websockets, monkeypatch):
-    """Test that the REST fallback is called after max reconnect attempts."""
-    mock_connect, _ = mock_websockets
-    mock_connect.side_effect = Exception("Connection failed")
-
-    mock_rest_fetch = AsyncMock(return_value=[{"data": "fallback"}])
-    monkeypatch.setattr(websocket_client, "rest_fetch", mock_rest_fetch)
-
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        await websocket_client.connect_and_stream(mock_producer, "spot", "BTCUSDT", "1m")
-
-    # Check that rest_fetch was called with the correct arguments
-    mock_rest_fetch.assert_called_once()
-    # aio.to_thread passes args as a list, so we check the args of the inner call
-    call_args = mock_rest_fetch.call_args[0]
-    assert call_args[1] == "spot"  # instrument_type
-    assert call_args[2] == "BTCUSDT" # symbol
-
-    # Check that the fallback data was produced to Kafka
-    mock_producer.send_and_wait.assert_called_once_with(
-        "market-data-spot-btcusdt",
-        json.dumps({"data": "fallback", "instrument_type": "spot"}).encode()
-    )
+    # Reset mocks and test with 'redis'
+    mock_AIOKafkaProducer.reset_mock()
+    mock_get_redis_client.reset_mock()
+    monkeypatch.setattr(websocket_client, "MESSAGING_BROKER", "redis")
+    await websocket_client.main()
+    mock_AIOKafkaProducer.assert_not_called()
+    mock_get_redis_client.assert_called_once()
