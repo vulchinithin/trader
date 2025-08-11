@@ -5,3 +5,4 @@ pandas
 polars
 psycopg2-binary
 vectorbt
+python-logstash-async

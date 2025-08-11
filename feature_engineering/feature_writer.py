@@ -15,9 +15,11 @@ if __package__ is None or __package__ == '':
         sys.path.insert(0, project_root)
 
 from data_ingestion.config.config_loader import load_config
+from common.logging_setup import setup_logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("feature_writer")
+# --- Setup Logging ---
+setup_logging('feature-writer')
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 cfg = load_config()

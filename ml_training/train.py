@@ -24,9 +24,11 @@ if __package__ is None or __package__ == '':
 
 from data_ingestion.config.config_loader import load_config
 from ml_training.data_loader import load_training_data
+from common.logging_setup import setup_logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("trainer")
+# --- Setup Logging ---
+setup_logging('ml-trainer')
+logger = logging.getLogger(__name__)
 
 # --- Ray Tune Search Space ---
 XGBOOST_SEARCH_SPACE = {

@@ -18,15 +18,18 @@ if __package__ is None or __package__ == '':
     from data_ingestion.ingestion.rest_fallback import fetch_historical as rest_fetch
     from data_ingestion.ingestion.redis_client import get_redis_client, publish_to_redis_stream
     from data_ingestion.selection.asset_selector import AssetSelector
+    from common.logging_setup import setup_logging
 else:
     from ..config.config_loader import load_config
     from .rest_fallback import fetch_historical as rest_fetch
     from .redis_client import get_redis_client, publish_to_redis_stream
     from ..selection.asset_selector import AssetSelector
+    from common.logging_setup import setup_logging
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ws_client")
+# --- Setup Logging ---
+setup_logging('data-ingestion-ws')
+logger = logging.getLogger(__name__)
 
 cfg = load_config()
 

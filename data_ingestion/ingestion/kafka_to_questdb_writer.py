@@ -15,12 +15,15 @@ if __package__ is None or __package__ == '':
         sys.path.insert(0, project_root)
     from data_ingestion.config.config_loader import load_config
     from data_ingestion.ingestion.redis_client import get_redis_client
+    from common.logging_setup import setup_logging
 else:
     from ..config.config_loader import load_config
     from .redis_client import get_redis_client
+    from common.logging_setup import setup_logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("questdb_writer")
+# --- Setup Logging ---
+setup_logging('questdb-writer')
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 cfg = load_config()

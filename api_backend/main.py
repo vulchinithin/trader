@@ -13,7 +13,11 @@ if __package__ is None or __package__ == '':
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+from common.logging_setup import setup_logging
 from api_backend.kafka_consumer import kafka_consumer
+
+# --- Setup Logging ---
+setup_logging('api-backend')
 
 # --- Connection Manager ---
 class ConnectionManager:

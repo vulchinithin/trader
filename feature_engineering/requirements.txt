@@ -1,3 +1,4 @@
 polars
 aiokafka
 numpy
+python-logstash-async

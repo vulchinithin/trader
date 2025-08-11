@@ -10,6 +10,13 @@ if __package__ is None or __package__ == '':
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+from common.logging_setup import setup_logging
+import logging
+
+# --- Setup Logging ---
+setup_logging('orchestration-flow')
+logger = logging.getLogger(__name__)
+
 async def run_process(command: str):
     """Helper function to run a command and stream its output."""
     print(f"--- Running command: {command} ---")

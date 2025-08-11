@@ -4,3 +4,4 @@ aiokafka
 # For testing the API
 httpx
 pytest
+python-logstash-async

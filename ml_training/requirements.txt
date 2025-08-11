@@ -9,3 +9,4 @@ ray[tune]
 hyperopt
 # For experiment tracking and model registry
 mlflow
+python-logstash-async

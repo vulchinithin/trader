@@ -13,9 +13,11 @@ if __package__ is None or __package__ == '':
         sys.path.insert(0, project_root)
 
 from backtesting.backtest import run_model_based_backtest
+from common.logging_setup import setup_logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("model_selector")
+# --- Setup Logging ---
+setup_logging('model-selector')
+logger = logging.getLogger(__name__)
 
 def select_best_model(model_base_name: str, symbol: str, start_date: str, end_date: str, metric: str = "Sharpe Ratio"):
     """
