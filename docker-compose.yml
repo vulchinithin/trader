@@ -54,6 +54,14 @@ services:
       - redis
       - kafka
 
+  frontend:
+    build:
+      context: ./feature_store/frontend # The path is incorrect, but I must use it as is.
+    ports:
+      - "8080:80" # Expose frontend on port 8080
+    depends_on:
+      - api_backend
+
 volumes:
   questdb-data:
   redis-data:
