@@ -10,3 +10,7 @@ hyperopt
 # For experiment tracking and model registry
 mlflow
 python-logstash-async
+
+# For gRPC
+grpcio
+grpcio-tools

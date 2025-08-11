@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package orchestrator;
+
+// The service definition for the Orchestrator's control plane.
+// Services will implement this interface to be controlled by the Clock.
+service Orchestrator {
+  // A simple RPC to trigger a task in a service.
+  rpc TriggerTask (TriggerRequest) returns (TriggerResponse) {}
+}
+
+// The request message containing the details of the task to trigger.
+message TriggerRequest {
+  // The name of the task to be triggered, e.g., "train_model".
+  string task_name = 1;
+
+  // A map of parameters for the task, e.g., {"symbol": "BTCUSDT"}.
+  map<string, string> parameters = 2;
+}
+
+// The response message indicating the result of the trigger.
+message TriggerResponse {
+  // A status message, e.g., "Task 'train_model' triggered successfully."
+  string status_message = 1;
+
+  // A unique identifier for the triggered task instance, if available.
+  string task_id = 2;
+}
