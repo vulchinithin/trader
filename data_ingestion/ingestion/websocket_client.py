@@ -8,6 +8,7 @@ import os
 from aiokafka import AIOKafkaProducer
 import websockets
 from kafka.admin import KafkaAdminClient, NewTopic
+from typing import Dict, Any
 
 # This allows the script to be run directly for development, while also supporting package imports.
 if __package__ is None or __package__ == '':
@@ -31,17 +32,50 @@ else:
 setup_logging('data-ingestion-ws')
 logger = logging.getLogger(__name__)
 
+# --- Configuration ---
 cfg = load_config()
-
-# Constants from config
-STREAMS = cfg["binance"]["streams"]
-MAX_ATTEMPTS = cfg["binance"]["reconnect"]["max_attempts"]
-BASE = cfg["binance"]["reconnect"]["backoff_base"]
-FACTOR = cfg["binance"]["reconnect"]["backoff_factor"]
-PING_INTERVAL = cfg["binance"]["ping_interval"]
+MAX_ATTEMPTS = cfg["reconnect"]["max_attempts"]
+BASE = cfg["reconnect"]["backoff_base"]
+FACTOR = cfg["reconnect"]["backoff_factor"]
+PING_INTERVAL = cfg["ping_interval"]
 KAFKA_BOOTSTRAP_SERVERS = cfg['kafka']['bootstrap_servers']
-RATE_LIMIT_BACKOFF = cfg.get("binance", {}).get("rate_limit_backoff", 60)
+RATE_LIMIT_BACKOFF = cfg.get("rate_limit_backoff", 60)
 MESSAGING_BROKER = cfg.get("messaging", {}).get("broker", "kafka")
+
+
+def normalize_data(exchange: str, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes data from different exchanges into a common internal format.
+    """
+    if exchange == 'binance':
+        if raw_data.get('e') == 'kline':
+            k = raw_data['k']
+            return {
+                'exchange': exchange,
+                'symbol': raw_data['s'],
+                'timestamp': k['t'],
+                'open': k['o'],
+                'high': k['h'],
+                'low': k['l'],
+                'close': k['c'],
+                'volume': k['v'],
+                'is_final': k['x']
+            }
+    elif exchange == 'coinbase':
+        if raw_data.get('type') == 'ticker':
+            return {
+                'exchange': exchange,
+                'symbol': raw_data['product_id'],
+                'timestamp': int(time.time() * 1000), # Coinbase ticker does not have a timestamp
+                'open': raw_data.get('open_24h'),
+                'high': raw_data.get('high_24h'),
+                'low': raw_data.get('low_24h'),
+                'close': raw_data.get('price'),
+                'volume': raw_data.get('volume_24h'),
+                'is_final': False
+            }
+    # Return raw data if no normalization rule matches
+    return raw_data
 
 
 async def publish_message(kafka_producer, redis_client, topic, message):
@@ -59,71 +93,77 @@ async def produce_to_kafka(producer, topic, message):
     except Exception as e:
         logger.error(f"Failed to publish to Kafka topic {topic}: {e}")
 
-async def send_heartbeat(ws):
-    """Sends a periodic heartbeat to the WebSocket connection."""
-    while True:
-        try:
-            await asyncio.sleep(PING_INTERVAL)
-            await ws.ping()
-            logger.debug("Heartbeat ping sent")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"Heartbeat failed: {e}. Forcing reconnection.")
-            raise
+async def connect_and_stream(kafka_producer, redis_client, portfolio: Dict[str, Any]):
+    """Connects to a WebSocket stream for a given portfolio, handles data, and manages reconnection."""
+    exchange = portfolio['exchange']
+    exchange_cfg = cfg['exchanges'][exchange]
 
-async def connect_and_stream(kafka_producer, redis_client, instrument_type, symbol, interval):
-    """Connects to a WebSocket stream, handles data, and manages reconnection."""
-    base_url = cfg['binance']['instrument_urls'].get(instrument_type)
-    if not base_url:
-        logger.error(f"Base URL for instrument '{instrument_type}' not found in config.")
-        return
-
-    stream_names = [s.format(symbol=symbol.lower(), interval=interval) for s in STREAMS]
-    url = f"{base_url}/{'/'.join(stream_names)}"
     attempt = 0
-    topic = f"market-data-{instrument_type}-{symbol.lower()}"
-
     while attempt < MAX_ATTEMPTS:
         try:
-            async with websockets.connect(url, ping_interval=None, ping_timeout=None) as ws:
-                logger.info(f"Connected to {url}")
-                heartbeat_task = asyncio.create_task(send_heartbeat(ws))
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=PING_INTERVAL * 2)
-                        data = json.loads(raw)
-                        data['instrument_type'] = instrument_type
-                        asyncio.create_task(publish_message(kafka_producer, redis_client, topic, data))
-                    except asyncio.TimeoutError:
-                        logger.warning(f"No message from {symbol} for {PING_INTERVAL * 2}s. Reconnecting.")
-                        raise
+            # --- Connection and Subscription ---
+            # For now, we only support one instrument type per portfolio for simplicity
+            instrument = portfolio['instruments'][0]
+            base_url = exchange_cfg['instrument_urls'][instrument]
+
+            if exchange_cfg['stream_format'] == 'path':
+                # Binance-style: streams are in the URL path
+                stream_names = []
+                for i, symbol in enumerate(portfolio['symbols']):
+                    interval = portfolio['frequencies'][i]
+                    # For now, just use the kline stream for simplicity
+                    stream_names.append(f"{symbol.lower()}@kline_{interval}")
+                url = f"{base_url}/{'/'.join(stream_names)}"
+
+                async with websockets.connect(url, ping_interval=PING_INTERVAL) as ws:
+                    logger.info(f"Connected to {exchange} at {url}")
+                    # No separate subscription message needed for Binance
+                    await receive_loop(ws, kafka_producer, redis_client, portfolio)
+
+            elif exchange_cfg['stream_format'] == 'json_message':
+                # Coinbase-style: connect first, then send a subscription message
+                async with websockets.connect(base_url, ping_interval=PING_INTERVAL) as ws:
+                    logger.info(f"Connected to {exchange} at {base_url}")
+                    sub_msg = exchange_cfg['subscription_message'].copy()
+                    sub_msg['product_ids'] = portfolio['symbols']
+                    await ws.send(json.dumps(sub_msg))
+                    logger.info(f"Sent subscription message to {exchange}: {sub_msg}")
+                    await receive_loop(ws, kafka_producer, redis_client, portfolio)
+
+            # If the loop exits cleanly, break the retry loop
+            break
+
         except websockets.exceptions.ConnectionClosed as e:
-            if 'heartbeat_task' in locals() and not heartbeat_task.done():
-                heartbeat_task.cancel()
-            if e.code == 1013 or "rate limit" in str(e.reason).lower() or "429" in str(e.reason):
-                logger.error(f"Rate limit for {symbol} ({instrument_type}). Backing off for {RATE_LIMIT_BACKOFF}s. Reason: {e.reason}")
-                await asyncio.sleep(RATE_LIMIT_BACKOFF)
-            else:
-                wait = BASE * (FACTOR ** attempt) + random.uniform(0, 1)
-                logger.warning(f"Conn closed for {symbol} ({instrument_type}): {e}. Retrying in {wait:.1f}s")
-                await asyncio.sleep(wait)
-                attempt += 1
-        except Exception as e:
-            if 'heartbeat_task' in locals() and not heartbeat_task.done():
-                heartbeat_task.cancel()
             wait = BASE * (FACTOR ** attempt) + random.uniform(0, 1)
-            logger.warning(f"Unhandled exception for {symbol} ({instrument_type}): {e}. Retrying in {wait:.1f}s")
+            logger.warning(f"Conn closed for {exchange}: {e}. Retrying in {wait:.1f}s")
+            await asyncio.sleep(wait)
+            attempt += 1
+        except Exception as e:
+            wait = BASE * (FACTOR ** attempt) + random.uniform(0, 1)
+            logger.warning(f"Unhandled exception for {exchange}: {e}. Retrying in {wait:.1f}s", exc_info=True)
             await asyncio.sleep(wait)
             attempt += 1
 
-    logger.error(f"Max attempts for {symbol} ({instrument_type}). Falling back to REST.")
-    historical = await asyncio.to_thread(rest_fetch, cfg, instrument_type, symbol, interval, limit=500)
-    for item in historical:
-        item['instrument_type'] = instrument_type
-        asyncio.create_task(publish_message(kafka_producer, redis_client, topic, item))
+    logger.error(f"Max reconnection attempts reached for portfolio on exchange '{exchange}'.")
+    # Note: Fallback to REST is more complex with multiple exchanges and is omitted for now.
 
-def ensure_topics(instruments, symbols):
+async def receive_loop(ws, kafka_producer, redis_client, portfolio):
+    """The main loop to receive and process messages from a WebSocket."""
+    exchange = portfolio['exchange']
+    while True:
+        raw = await ws.recv()
+        data = json.loads(raw)
+
+        normalized_data = normalize_data(exchange, data)
+
+        if normalized_data and 'symbol' in normalized_data:
+            # Construct topic from normalized data
+            topic = f"market-data-{exchange}-{normalized_data['symbol'].lower()}"
+            asyncio.create_task(publish_message(kafka_producer, redis_client, topic, normalized_data))
+        else:
+            logger.debug(f"Received non-trade message from {exchange}: {data}")
+
+def ensure_topics(portfolios: List[Dict[str, Any]]):
     """Ensures that the necessary Kafka topics exist if Kafka is the broker."""
     if MESSAGING_BROKER not in ["kafka", "both"]:
         return
@@ -134,9 +174,9 @@ def ensure_topics(instruments, symbols):
         replication_factor = cfg.get("kafka", {}).get("replication_factor", 1)
 
         topics_to_create = []
-        for instrument in instruments:
-            for symbol in symbols:
-                topic = f"market-data-{instrument}-{symbol.lower()}"
+        for p in portfolios:
+            for symbol in p['symbols']:
+                topic = f"market-data-{p['exchange']}-{symbol.lower()}"
                 if topic not in existing_topics:
                     topics_to_create.append(NewTopic(name=topic, num_partitions=num_partitions, replication_factor=replication_factor))
 
@@ -156,36 +196,24 @@ async def main():
     try:
         # Initialize clients based on config
         if MESSAGING_BROKER in ["kafka", "both"]:
-            kafka_producer = AIOKafkaProducer(
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                compression_type="zstd"
-            )
+            kafka_producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, compression_type="zstd")
             await kafka_producer.start()
 
         if MESSAGING_BROKER in ["redis", "both"] or cfg.get("selection", {}).get("mode") == "autonomous":
             redis_client = get_redis_client(cfg)
-            if not redis_client:
-                logger.error("Could not establish Redis connection. Aborting.")
-                if kafka_producer: await kafka_producer.stop()
-                return
 
         # Select assets
         asset_selector = AssetSelector(cfg, redis_client)
-        symbols, frequencies, instruments = asset_selector.get_selected_assets()
+        selected_portfolios = asset_selector.get_selected_assets()
 
-        if not all([instruments, symbols, frequencies]):
-            logger.error("No assets selected to subscribe. Check your configuration and data.")
+        if not selected_portfolios:
+            logger.error("No portfolios selected to subscribe. Check your configuration and data.")
             return
 
-        if MESSAGING_BROKER in ["kafka", "both"]:
-            ensure_topics(instruments, symbols)
+        ensure_topics(selected_portfolios)
 
-        tasks = []
-        # The new selector returns a list of symbols and a parallel list of frequencies
-        for instrument in instruments:
-            for i, symbol in enumerate(symbols):
-                interval = frequencies[i] if i < len(frequencies) else "1m"
-                tasks.append(connect_and_stream(kafka_producer, redis_client, instrument, symbol, interval))
+        # Create a connection task for each portfolio
+        tasks = [connect_and_stream(kafka_producer, redis_client, p) for p in selected_portfolios]
 
         if tasks:
             await asyncio.gather(*tasks)

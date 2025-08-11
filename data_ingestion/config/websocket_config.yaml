@@ -1,23 +1,40 @@
 # config/websocket_config.yaml
-binance:
-  # Base URLs for different instrument types
-  instrument_urls:
-    spot: "wss://stream.binance.com:9443/ws"
-    futures_usdm: "wss://fstream.binance.com/ws"
-    futures_coinm: "wss://dstream.binance.com/ws"
 
-  # Stream definitions that can be applied to any instrument type
-  streams:
-    - "{symbol}@trade"
-    - "{symbol}@kline_{interval}"
-    - "{symbol}@bookTicker"
+# This file contains the technical connection details for each exchange's WebSocket service.
 
-  reconnect:
-    max_attempts: 10
-    backoff_base: 1      # seconds
-    backoff_factor: 2
+exchanges:
+  binance:
+    # Base URLs for different instrument types
+    instrument_urls:
+      spot: "wss://stream.binance.com:9443/ws"
+      futures_usdm: "wss://fstream.binance.com/ws"
+      futures_coinm: "wss://dstream.binance.com/ws"
 
-  ping_interval: 20    # seconds
+    # Stream definitions that can be applied to any instrument type
+    # For Binance, the streams are part of the URL path.
+    stream_format: "path"
+    streams:
+      - "{symbol}@trade"
+      - "{symbol}@kline_{interval}"
+      - "{symbol}@bookTicker"
 
-# Note: The specific assets to subscribe to (symbols, intervals, instruments)
-# are now managed in 'selection_config.yaml' to centralize selection logic.
+  coinbase:
+    # Coinbase has a single WebSocket URL.
+    instrument_urls:
+      spot: "wss://ws-feed.pro.coinbase.com"
+
+    # For Coinbase, you subscribe by sending a JSON message after connecting.
+    stream_format: "json_message"
+    subscription_message:
+      type: "subscribe"
+      product_ids: [] # This will be populated with symbols
+      channels: ["ticker", "level2"] # Example channels
+
+# Common settings
+reconnect:
+  max_attempts: 10
+  backoff_base: 1      # seconds
+  backoff_factor: 2
+
+ping_interval: 20    # seconds
+rate_limit_backoff: 60 # seconds
